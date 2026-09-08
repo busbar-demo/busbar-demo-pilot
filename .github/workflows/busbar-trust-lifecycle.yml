@@ -1,0 +1,144 @@
+name: Busbar Trust Lifecycle
+
+# The zero-trust loop, end to end: a job asks for a Salesforce session, is
+# REFUSED, an admin approves the request in the org, and the identical command
+# then succeeds. No secret is ever stored in this repo.
+#
+# The org is chosen by GitHub ENVIRONMENT, never by a typed URL. Two reasons,
+# and both are load-bearing:
+#
+#   1. A `target_instance` dispatch input lets anyone who can run the workflow
+#      point it at ANY org. The environment is the allow-list: SF_INSTANCE_URL
+#      lives on the environment, so a run can only ever reach an org someone
+#      deliberately configured, and environment protection rules (required
+#      reviewers, branch limits) gate who can select it.
+#   2. GitHub stamps the environment name into the OIDC token as the
+#      `environment` claim. That makes it part of the AUTH GRANT: the org's
+#      trust policy pins `environment`, so a token minted for `demo-pilot`
+#      cannot be replayed to satisfy a `production` rule. A typed URL is
+#      invisible to the token and therefore unpinnable.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target org (GitHub Environment — supplies SF_INSTANCE_URL and the OIDC `environment` claim)
+        type: environment
+        required: true
+      step:
+        description: Which half of the lifecycle to run
+        type: choice
+        required: true
+        default: provoke
+        options: [provoke, verify]
+
+permissions:
+  contents: read
+
+jobs:
+  exchange:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      contents: read
+      # REQUIRED. This is what makes GitHub inject ACTIONS_ID_TOKEN_REQUEST_URL
+      # and _TOKEN into the job. They are per-job runtime values, not a
+      # constructible pattern: the URL carries this run's plan/job identifiers
+      # and the token is a short-lived bearer credential. Their injection IS the
+      # authorization — GitHub attesting that this job may mint an identity
+      # token for this repo. If they could be constructed, anyone could mint a
+      # token for any repository and the trust model would be worthless.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI + the busbar plugin
+        run: |
+          npm install -g @salesforce/cli@2.139.6
+          npm install -g @composable-delivery/sf-busbar-plugin || \
+            echo "::notice::plugin not published yet — see the note in the job summary"
+
+      # No BUSBAR_ECA_CLIENT_ID and no --eca-client-id, deliberately. The ECA
+      # consumer key is baked into the plugin (shared/busbar-defaults.json) and
+      # is PBO-pinned and identical in every install — it is a public client id,
+      # not a secret ("Require secret for Token Exchange Flow" is OFF). CI only
+      # passes it to force run-scoped keys; a subscriber never needs to.
+      #
+      # No --oidc-audience either: it defaults to the target instance, which is
+      # exactly what the handler compares against.
+      # DIAGNOSTIC — shows WHY the OIDC endpoint cannot be constructed.
+      # Prints the URL's shape with the per-run GUIDs replaced, and never prints
+      # ACTIONS_ID_TOKEN_REQUEST_TOKEN, which is a live bearer credential.
+      - name: Show the shape of the runner's OIDC endpoint
+        run: |
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || {
+            echo "Not injected -- this job lacks permissions: id-token: write."
+            exit 0
+          }
+          echo "host:      $(echo "$ACTIONS_ID_TOKEN_REQUEST_URL" | sed -E 's#^https://([^/]+)/.*#\1#')"
+          echo "path:      $(echo "$ACTIONS_ID_TOKEN_REQUEST_URL" \
+                    | sed -E 's#^https://[^/]+##; s#/[0-9a-fA-F-]{36}#/<guid>#g; s#/[A-Za-z0-9_-]{20,}#/<opaque>#g')"
+          echo "token set: $([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no) (value never printed -- it is a bearer credential)"
+          echo
+          echo "The guid segments are minted per run, so this URL cannot be derived"
+          echo "ahead of time. GitHub injects it only because this job declared"
+          echo "permissions: id-token: write -- that injection IS the authorization."
+
+      - name: Exchange the runner's OIDC token for a Salesforce session
+        id: exchange
+        continue-on-error: ${{ inputs.step == 'provoke' }}
+        env:
+          SF_INSTANCE_URL: ${{ vars.SF_INSTANCE_URL }}
+        run: |
+          set -o pipefail
+          test -n "$SF_INSTANCE_URL" || {
+            echo "::error::Environment '${{ inputs.environment }}' has no SF_INSTANCE_URL variable."
+            exit 1
+          }
+          echo "Target org (from the environment, not from input): $SF_INSTANCE_URL"
+          sf busbar org auth github \
+            --target-instance "$SF_INSTANCE_URL" \
+            --alias demo-${{ inputs.step }} \
+            --token-handler GitHubTokenExchangeHandler \
+            --no-set-default \
+            --debug-dir artifacts/token-exchange/${{ inputs.step }} 2>&1 | tee exchange.log
+
+      - name: Assert the expected outcome
+        env:
+          OUTCOME: ${{ steps.exchange.outcome }}
+        run: |
+          if [ "${{ inputs.step }}" = "provoke" ]; then
+            if [ "$OUTCOME" = "success" ]; then
+              echo "::error::The exchange SUCCEEDED against an org with no matching trust policy. The deny path is not working."
+              exit 1
+            fi
+            echo "Correctly REFUSED. The org should now hold a Pending trust request."
+            {
+              echo "### Refused, as designed"
+              echo ""
+              echo "The org has no trust policy matching \`repository=${{ github.repository }}\`,"
+              echo "\`ref=${{ github.ref }}\`, \`environment=${{ inputs.environment }}\` — so it refused and"
+              echo "enqueued an approvable request. Approve it in the org, then re-run with **step: verify**."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            [ "$OUTCOME" = "success" ] || { echo "::error::Exchange failed after approval."; exit 1; }
+            echo "### Session granted" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "No secret is stored in this repository. The org made the decision from verified OIDC claims." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Show the claims the org authorized on (no secret here)
+        if: always()
+        run: |
+          echo "repository:  ${{ github.repository }}"
+          echo "ref:         ${{ github.ref }}"
+          echo "environment: ${{ inputs.environment }}   <-- in the OIDC token, and pinnable in the trust policy"
+          echo "actor:       ${{ github.actor }}"
+          echo "workflow:    ${{ github.workflow_ref }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: token-exchange-${{ inputs.step }}
+          path: artifacts/token-exchange/
+          if-no-files-found: ignore
