@@ -66,6 +66,24 @@ jobs:
       #
       # No --oidc-audience either: it defaults to the target instance, which is
       # exactly what the handler compares against.
+      # DIAGNOSTIC — shows WHY the OIDC endpoint cannot be constructed.
+      # Prints the URL's shape with the per-run GUIDs replaced, and never prints
+      # ACTIONS_ID_TOKEN_REQUEST_TOKEN, which is a live bearer credential.
+      - name: Show the shape of the runner's OIDC endpoint
+        run: |
+          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || {
+            echo "Not injected -- this job lacks permissions: id-token: write."
+            exit 0
+          }
+          echo "host:      $(echo "$ACTIONS_ID_TOKEN_REQUEST_URL" | sed -E 's#^https://([^/]+)/.*#\1#')"
+          echo "path:      $(echo "$ACTIONS_ID_TOKEN_REQUEST_URL" \
+                    | sed -E 's#^https://[^/]+##; s#/[0-9a-fA-F-]{36}#/<guid>#g; s#/[A-Za-z0-9_-]{20,}#/<opaque>#g')"
+          echo "token set: $([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no) (value never printed -- it is a bearer credential)"
+          echo
+          echo "The guid segments are minted per run, so this URL cannot be derived"
+          echo "ahead of time. GitHub injects it only because this job declared"
+          echo "permissions: id-token: write -- that injection IS the authorization."
+
       - name: Exchange the runner's OIDC token for a Salesforce session
         id: exchange
         continue-on-error: ${{ inputs.step == 'provoke' }}
